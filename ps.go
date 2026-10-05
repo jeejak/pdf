@@ -71,11 +71,7 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 	var dicts []dict
 	var rd io.Reader
 	if strm.Kind() == Array {
-		readers := make([]io.Reader, 0, strm.Len())
-		for i := 0; i < strm.Len(); i++ {
-			readers = append(readers, strm.Index(i).Reader())
-		}
-		rd = io.MultiReader(readers...)
+		rd = &contentsReader{streams: strm}
 	} else {
 		rd = strm.Reader()
 	}
@@ -169,6 +165,36 @@ Reading:
 			continue
 		}
 		stk.Push(Value{nil, objptr{}, obj})
+	}
+}
+
+// A contentsReader reads the streams of an array in turn, opening each only
+// once the one before it ends, so that a long array never holds a decoder
+// for every stream at once. An entry that is not a stream is skipped.
+type contentsReader struct {
+	streams Value
+	next    int
+	cur     io.Reader
+}
+
+func (c *contentsReader) Read(p []byte) (int, error) {
+	for {
+		for c.cur == nil {
+			if c.next >= c.streams.Len() {
+				return 0, io.EOF
+			}
+			if v := c.streams.Index(c.next); v.Kind() == Stream {
+				c.cur = v.Reader()
+			}
+			c.next++
+		}
+		n, err := c.cur.Read(p)
+		if err == io.EOF {
+			c.cur, err = nil, nil
+		}
+		if n > 0 || err != nil {
+			return n, err
+		}
 	}
 }
 
