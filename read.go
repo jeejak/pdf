@@ -86,6 +86,11 @@ type Reader struct {
 	trailerptr objptr
 	key        []byte
 	useAES     bool
+
+	// noObjStm marks a view that resolves nothing stored in an object
+	// stream; an object stream's header is read through one, so one stream's
+	// header cannot make another stream load.
+	noObjStm bool
 }
 
 type xref struct {
@@ -852,7 +857,12 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 
 		var obj object
 		if xref.inStream {
-			strm := r.resolveAt(parent, xref.stream, depth+1)
+			if r.noObjStm {
+				return Value{}
+			}
+			view := *r
+			view.noObjStm = true
+			strm := view.resolveAt(parent, xref.stream, depth+1)
 			extends := 0
 		Search:
 			for {
