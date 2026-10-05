@@ -124,6 +124,10 @@ const (
 	// is built from object references and can be made cyclic.
 	maxObjStmExtends = 32
 
+	// maxObjStmBytes bounds the decoded size of an object stream. Real ones
+	// run to a few hundred kilobytes.
+	maxObjStmBytes = 16 << 20
+
 	// maxResolveDepth bounds recursion through objects stored inside object
 	// streams, which can be made to reference each other in a cycle.
 	maxResolveDepth = 32
@@ -882,7 +886,7 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 				if first == 0 {
 					panic("missing First")
 				}
-				b := newBuffer(strm.Reader(), 0)
+				b := newBuffer(newLimitedReader(strm.Reader(), maxObjStmBytes), 0)
 				b.allowEOF = true
 				for i := 0; i < n; i++ {
 					id, ok1 := b.readToken().(int64)
@@ -931,6 +935,25 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 	default:
 		panic(fmt.Errorf("unexpected value type %T in resolve", x))
 	}
+}
+
+// A limitedReader fails once more than max bytes have been read from r, where
+// io.LimitReader would end quietly and truncated data would read as shorter.
+type limitedReader struct {
+	r      io.Reader
+	n, max int64
+}
+
+func newLimitedReader(r io.Reader, max int64) *limitedReader {
+	return &limitedReader{r: r, n: max, max: max}
+}
+
+func (l *limitedReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if l.n -= int64(n); l.n < 0 {
+		return 0, fmt.Errorf("stream exceeds %d bytes", l.max)
+	}
+	return n, err
 }
 
 type errorReadCloser struct {
