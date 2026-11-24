@@ -455,12 +455,12 @@ func contentsArrayPDF(k, filters int) []byte {
 }
 
 // TestHostile_AContentsArrayOpensOneDecoderAtATime: a page whose
-// /Contents array names one Flate stream 20,000 times. Interpret opened
-// a decoder for every entry before reading any, about 45 KiB each, so
-// 120 KB of file held about 900 MiB at once. It now opens each when the
-// one before it ends, and the page still reads.
+// /Contents array names one Flate stream maxContentsStreams times, the
+// most a page may. Interpret opened a decoder for every entry before
+// reading any, about 45 KiB each (20,000 entries peaked at 893 MiB). It
+// now opens each when the one before it ends, and the page still reads.
 func TestHostile_AContentsArrayOpensOneDecoderAtATime(t *testing.T) {
-	data := contentsArrayPDF(20_000, 1)
+	data := contentsArrayPDF(maxContentsStreams, 1)
 	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
@@ -470,15 +470,112 @@ func TestHostile_AContentsArrayOpensOneDecoderAtATime(t *testing.T) {
 	peak := peakHeapDuring(func() {
 		Interpret(r.Page(1).V.Key("Contents"), func(stk *Stack, op string) { ops++ })
 	})
-	if want := 2 * 20_000; ops != want {
+	if want := 2 * maxContentsStreams; ops != want {
 		t.Fatalf("read %d operators, want %d", ops, want)
 	}
-	if peak > 128<<20 {
-		t.Fatalf("%d bytes: the heap peaked at %d MiB while reading, want under 128 MiB: "+
+	if peak > 16<<20 {
+		t.Fatalf("%d bytes: the heap peaked at %d MiB while reading, want under 16 MiB: "+
 			"the decoders are opened up front again", len(data), peak>>20)
 	}
 	t.Logf("%d bytes: %d operators in %s, heap peak %d MiB", len(data), ops,
 		time.Since(start).Round(time.Millisecond), peak>>20)
+}
+
+// TestHostile_ALongContentsArrayIsRefusedQuickly: one 8-stage Flate
+// stream named 262,000 times (about 1.5 MB). Read one stream at a time
+// the heap stays small, but every entry builds eight decoders, so one
+// Interpret call ran about 11 seconds, past any caller's deadline and out
+// of reach of its stop flag. An array over maxContentsStreams is refused
+// before any stream is opened.
+func TestHostile_ALongContentsArrayIsRefusedQuickly(t *testing.T) {
+	data := contentsArrayPDF(262_000, 8)
+	start := time.Now()
+	assertRefused(t, data, 256<<20)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("refused after %s, want under 2s", took)
+	}
+}
+
+// TestHostile_TheMostContentStreamsAPageMayHaveReadInBoundedTime is the
+// cap's own time bound: maxContentsStreams entries of an 8-stage stream,
+// the most the two caps allow together.
+func TestHostile_TheMostContentStreamsAPageMayHaveReadInBoundedTime(t *testing.T) {
+	data := contentsArrayPDF(maxContentsStreams, maxFilters)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	start := time.Now()
+	ops := 0
+	Interpret(r.Page(1).V.Key("Contents"), func(stk *Stack, op string) { ops++ })
+	took := time.Since(start)
+	if want := 2 * maxContentsStreams; ops != want {
+		t.Fatalf("read %d operators, want %d", ops, want)
+	}
+	if took > 2*time.Second {
+		t.Fatalf("one Interpret call took %s, want under 2s", took)
+	}
+	t.Logf("%d streams of %d stages: %s", maxContentsStreams, maxFilters, took.Round(time.Millisecond))
+}
+
+// streamsPDF is one page whose /Contents array is the given streams, in
+// order, uncompressed.
+func streamsPDF(streams ...string) []byte {
+	var refs strings.Builder
+	objs := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"",
+	}
+	for i, c := range streams {
+		fmt.Fprintf(&refs, "%d 0 R ", 4+i)
+		objs = append(objs, fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(c), c))
+	}
+	objs[2] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents [" + refs.String() + "] >>"
+	var out bytes.Buffer
+	out.WriteString("%PDF-1.4\n")
+	offs := make([]int, len(objs))
+	for i, o := range objs {
+		offs[i] = out.Len()
+		fmt.Fprintf(&out, "%d 0 obj\n%s\nendobj\n", i+1, o)
+	}
+	xref := out.Len()
+	fmt.Fprintf(&out, "xref\n0 %d\n0000000000 65535 f \n", len(objs)+1)
+	for _, off := range offs {
+		fmt.Fprintf(&out, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&out, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xref)
+	return out.Bytes()
+}
+
+// TestContents_StreamsJoinWithNoSeparator pins the join upstream chose
+// (ledongthuc/pdf 8b43568, "Fix tokens split across content streams"): a
+// /Contents array reads as its streams' bytes back to back, so a string
+// or an operator split across two streams reads as one token. The harden
+// branch puts a newline between streams instead; carrying that would
+// change what such a page reads, and this test would fail.
+func TestContents_StreamsJoinWithNoSeparator(t *testing.T) {
+	data := streamsPDF("BT (Hel", "lo) T", "j ET")
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	var ops, strs []string
+	Interpret(r.Page(1).V.Key("Contents"), func(stk *Stack, op string) {
+		ops = append(ops, op)
+		if op == "Tj" {
+			strs = append(strs, stk.Pop().RawString())
+		}
+		for stk.Len() > 0 {
+			stk.Pop()
+		}
+	})
+	if got := strings.Join(ops, " "); got != "BT Tj ET" {
+		t.Fatalf("operators = %q, want %q", got, "BT Tj ET")
+	}
+	if len(strs) != 1 || strs[0] != "Hello" {
+		t.Fatalf("Tj strings = %q, want [\"Hello\"]", strs)
+	}
 }
 
 // TestHostile_TooManyStackedFiltersAreRefused: one stream decoded
