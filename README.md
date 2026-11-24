@@ -17,7 +17,7 @@ directive and no import changes:
 replace github.com/ledongthuc/pdf => github.com/jeejak/pdf <version>
 ```
 
-What changed, and why. Each guard below is a cherry-pick from the hardening
+What changed, and why. Each guard below but one is a cherry-pick from the hardening
 branch at [Cwooper/pdf `harden`](https://github.com/Cwooper/pdf/tree/harden)
 (catalogued in issue 92 of the parent repository), applied with its original
 author and message; each commit names its source commit, and says which
@@ -31,7 +31,8 @@ base.
 | An object stream decodes at most 16 MiB | an object placed past inflated zeros was inflated on every resolve | `3d015d1` (Cwooper) |
 | Interpret reads at most 64 MiB of decoded content | a few KB of Flate fed the lexer gigabytes | `0384e0b` (Cwooper) |
 | Interpret holds at most 2^18 operands, counting the entries of the arrays and dicts on its stack | a content stream of operands and no operator grew memory without bound (117 KB reached a 6,470 MiB heap) | `4ed0098`, `9d3255d` (Cwooper) |
-| Interpret opens the streams of a /Contents array one at a time, skipping an entry that is not a stream | an array naming one Flate stream 20,000 times opened every decoder up front (120 KB peaked at 893 MiB) | `5350959` (Cwooper) |
+| Interpret opens the streams of a /Contents array one at a time, skipping an entry that is not a stream. Its per-entry charge against a decode budget is not carried, since the budget is not on this base, and neither is its newline between streams, since this base joins them as upstream does | an array naming one Flate stream 20,000 times opened every decoder up front (120 KB peaked at 893 MiB) | `5350959` (Cwooper), in part |
+| A /Contents array holds at most 1,024 streams. This replaces the per-entry charge as the time bound | one 8-stage stream named 262,000 times (1.5 MB) kept one Interpret call busy about 10 s | ours |
 | A stream's /Filter array holds at most 8 entries | stacked decoders were all built before any byte was read | the /Filter cap of `b7341a4` (Cwooper) |
 
 A refusal is reported the way this package already reports malformed
