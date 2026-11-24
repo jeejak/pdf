@@ -86,6 +86,11 @@ type Reader struct {
 	trailerptr objptr
 	key        []byte
 	useAES     bool
+
+	// noObjStm marks a view that resolves nothing stored in an object
+	// stream; an object stream's header is read through one, so one stream's
+	// header cannot make another stream load.
+	noObjStm bool
 }
 
 type xref struct {
@@ -93,6 +98,74 @@ type xref struct {
 	inStream bool
 	stream   objptr
 	offset   int64
+}
+
+// Limits applied to values read out of a PDF file. Every one of these is
+// attacker controlled, and without a bound a file of a few hundred bytes can
+// drive a multi-gigabyte allocation or an out-of-range slice index.
+const (
+	// maxXrefPrealloc bounds the entries preallocated from a declared /Size;
+	// a larger table grows as entries are read.
+	maxXrefPrealloc = 1 << 16
+
+	// maxObjectNumber bounds an object number, and with it the highest index a
+	// cross-reference table can reach. Object streams are compressed, so the
+	// file length is not a usable bound here: a small file can legitimately
+	// describe far more objects than it has bytes. This is instead a limit on
+	// object numbers themselves, well above any real document.
+	maxObjectNumber = 1 << 23
+
+	// maxXrefFieldWidth bounds an entry in an xref stream /W array. The
+	// widths are byte counts that decodeInt accumulates into an int, so a
+	// field wider than an int64 cannot be represented anyway.
+	maxXrefFieldWidth = 8
+
+	// maxObjStmExtends bounds the /Extends chain of an object stream, which
+	// is built from object references and can be made cyclic.
+	maxObjStmExtends = 32
+
+	// maxObjStmBytes bounds the decoded size of an object stream. Real ones
+	// run to a few hundred kilobytes.
+	maxObjStmBytes = 16 << 20
+
+	// maxResolveDepth bounds recursion through objects stored inside object
+	// streams, which can be made to reference each other in a cycle.
+	//
+	// Jeejak fork: this is the backstop, not the guard. Since the header
+	// view (noObjStm, below in resolveAt) an object stream's header never
+	// resolves into another object stream, so resolving recurses at most
+	// one level and this cap is not reached. It stays because a stack
+	// overflow is fatal rather than recoverable, so a later change that
+	// reopens the recursion must still meet a bound. The depth restarts at
+	// zero on each Value.Key, so on its own it does not stop a cycle that
+	// runs through a header (see jeejak_hostile_test.go).
+	maxResolveDepth = 32
+
+	// maxPredictorColumns bounds the /Columns of a FlateDecode predictor,
+	// which sizes a row buffer.
+	maxPredictorColumns = 1 << 20
+
+	// maxFilters bounds a stream's /Filter array, whose decoders are all
+	// built before any byte is read. Real files chain two or three.
+	maxFilters = 8
+)
+
+// preallocXref returns a cross-reference table sized for the declared number of
+// entries, without letting the declaration alone decide the allocation.
+func preallocXref(size int64) []xref {
+	if size > maxXrefPrealloc {
+		size = maxXrefPrealloc
+	}
+	return make([]xref, size)
+}
+
+// checkObjectNumber reports whether x may be used as a cross-reference table
+// index.
+func checkObjectNumber(x int64) error {
+	if x < 0 || x > maxObjectNumber {
+		return fmt.Errorf("object number %d out of range [0, %d]", x, maxObjectNumber)
+	}
+	return nil
 }
 
 // Open opens a file for reading.
@@ -136,6 +209,9 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		}
 	}()
 
+	if size < int64(len("%PDF-1.0\n%%EOF")) {
+		return nil, fmt.Errorf("not a PDF file: too short")
+	}
 	buf := make([]byte, 10)
 	f.ReadAt(buf, 0)
 	if !bytes.HasPrefix(buf, []byte("%PDF-1.")) || buf[7] < '0' || buf[7] > '7' || buf[8] != '\r' && buf[8] != '\n' {
@@ -143,10 +219,13 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 	end := size
 	const endChunk = 100
-	buf = make([]byte, endChunk)
-	f.ReadAt(buf, end-endChunk)
-	for len(buf) > 0 && buf[len(buf)-1] == '\n' || buf[len(buf)-1] == '\r' {
-		buf = buf[:len(buf)-1]
+	chunk := int64(endChunk)
+	if chunk > end {
+		chunk = end
+	}
+	buf = make([]byte, chunk)
+	if _, err := f.ReadAt(buf, end-chunk); err != nil && err != io.EOF {
+		return nil, fmt.Errorf("not a PDF file: %v", err)
 	}
 	buf = bytes.TrimRight(buf, "\r\n\t ")
 	if !bytes.HasSuffix(buf, []byte("%%EOF")) {
@@ -161,7 +240,7 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		f:   f,
 		end: end,
 	}
-	pos := end - endChunk + int64(i)
+	pos := end - chunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
 	if b.readToken() != keyword("startxref") {
 		return nil, fmt.Errorf("malformed PDF file: missing startxref")
@@ -255,7 +334,11 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	if !ok {
 		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref stream missing Size")
 	}
-	table := make([]xref, size)
+	// A negative /Size would panic in make.
+	if err := checkObjectNumber(size); err != nil {
+		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref stream Size: %v", err)
+	}
+	table := preallocXref(size)
 
 	table, err := readXrefStreamData(r, strm, table, size)
 	if err != nil {
@@ -316,6 +399,12 @@ func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xre
 		if !ok || int64(int(i)) != i {
 			return nil, fmt.Errorf("invalid W array %v", objfmt(ww))
 		}
+		// A /W entry is a field width in bytes. A negative one slices the
+		// read buffer with a negative bound below, and a huge one makes
+		// wtotal, and with it the buffer, arbitrarily large.
+		if i < 0 || i > maxXrefFieldWidth {
+			return nil, fmt.Errorf("invalid W array %v", objfmt(ww))
+		}
 		w = append(w, int(i))
 	}
 	if len(w) < 3 {
@@ -336,6 +425,15 @@ func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xre
 			return nil, fmt.Errorf("malformed Index pair %v %v %T %T", objfmt(index[0]), objfmt(index[1]), index[0], index[1])
 		}
 		index = index[2:]
+		// start and n name the range of object numbers this subsection
+		// describes, and both index the table below. Unbounded, a two-element
+		// /Index grows the table without limit for one entry of input.
+		if err := checkObjectNumber(start); err != nil {
+			return nil, fmt.Errorf("invalid Index start: %v", err)
+		}
+		if err := checkObjectNumber(start + n); err != nil {
+			return nil, fmt.Errorf("invalid Index range: %v", err)
+		}
 		for i := 0; i < int(n); i++ {
 			_, err := io.ReadFull(data, buf)
 			if err != nil {
@@ -441,6 +539,15 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 		n, ok2 := b.readToken().(int64)
 		if !ok1 || !ok2 {
 			return nil, fmt.Errorf("malformed xref table")
+		}
+		// A subsection header names the object numbers that follow, and those
+		// index the table below. An unbounded start grows the table without
+		// limit for as little as one entry of input.
+		if err := checkObjectNumber(start); err != nil {
+			return nil, fmt.Errorf("malformed xref table: %v", err)
+		}
+		if err := checkObjectNumber(start + n); err != nil {
+			return nil, fmt.Errorf("malformed xref table: %v", err)
 		}
 		for i := 0; i < int(n); i++ {
 			off, ok1 := b.readToken().(int64)
@@ -742,6 +849,13 @@ func (v Value) Len() int {
 }
 
 func (r *Reader) resolve(parent objptr, x interface{}) Value {
+	return r.resolveAt(parent, x, 0)
+}
+
+// resolveAt resolves x, tracking how deeply it has recursed through object
+// streams. The depth is a parameter rather than Reader state so that a Reader
+// stays immutable once opened and remains safe to read from concurrently.
+func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 	if ptr, ok := x.(objptr); ok {
 		if ptr.id >= uint32(len(r.xref)) {
 			return Value{}
@@ -750,11 +864,30 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 		if xref.ptr != ptr || !xref.inStream && xref.offset == 0 {
 			return Value{}
 		}
+		// An object inside an object stream resolves through its container,
+		// and those references can be made to form a cycle. Bound the nesting:
+		// exhausting the goroutine stack is a fatal error no caller can
+		// recover from.
+		if depth >= maxResolveDepth {
+			panic("PDF object stream nesting too deep")
+		}
+
 		var obj object
 		if xref.inStream {
-			strm := r.resolve(parent, xref.stream)
+			if r.noObjStm {
+				return Value{}
+			}
+			view := *r
+			view.noObjStm = true
+			strm := view.resolveAt(parent, xref.stream, depth+1)
+			extends := 0
 		Search:
 			for {
+				// /Extends is an object reference and can point back into the
+				// chain, so cap its length rather than following it forever.
+				if extends++; extends > maxObjStmExtends {
+					panic("object stream /Extends chain too long")
+				}
 				if strm.Kind() != Stream {
 					panic("not a stream")
 				}
@@ -766,11 +899,17 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 				if first == 0 {
 					panic("missing First")
 				}
-				b := newBuffer(strm.Reader(), 0)
+				b := newBuffer(newLimitedReader(strm.Reader(), maxObjStmBytes), 0)
 				b.allowEOF = true
 				for i := 0; i < n; i++ {
-					id, _ := b.readToken().(int64)
-					off, _ := b.readToken().(int64)
+					id, ok1 := b.readToken().(int64)
+					off, ok2 := b.readToken().(int64)
+					// /N is a declared count, not a measured one. Stop at the
+					// first non-integer or end of stream instead of spinning
+					// through however many pairs the file claims.
+					if !ok1 || !ok2 {
+						break
+					}
 					if uint32(id) == ptr.id {
 						b.seekForward(first + off)
 						x = b.readObject()
@@ -809,6 +948,25 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 	default:
 		panic(fmt.Errorf("unexpected value type %T in resolve", x))
 	}
+}
+
+// A limitedReader fails once more than max bytes have been read from r, where
+// io.LimitReader would end quietly and truncated data would read as shorter.
+type limitedReader struct {
+	r      io.Reader
+	n, max int64
+}
+
+func newLimitedReader(r io.Reader, max int64) *limitedReader {
+	return &limitedReader{r: r, n: max, max: max}
+}
+
+func (l *limitedReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if l.n -= int64(n); l.n < 0 {
+		return 0, fmt.Errorf("stream exceeds %d bytes", l.max)
+	}
+	return n, err
 }
 
 type errorReadCloser struct {
@@ -852,6 +1010,9 @@ func (v Value) Reader() io.ReadCloser {
 	case Name:
 		rd = applyFilter(rd, filter.Name(), param)
 	case Array:
+		if filter.Len() > maxFilters {
+			panic(fmt.Errorf("stream has %d filters, more than %d", filter.Len(), maxFilters))
+		}
 		for i := 0; i < filter.Len(); i++ {
 			rd = applyFilter(rd, filter.Index(i).Name(), param.Index(i))
 		}
@@ -874,6 +1035,13 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 			return zr
 		}
 		columns := param.Key("Columns").Int64()
+		// /Columns sizes the two row buffers below. A negative value panics in
+		// make, and a large one allocates without bound. Xref streams are
+		// routinely FlateDecode/Predictor 12, so this is reached while merely
+		// opening a file.
+		if columns < 0 || columns > maxPredictorColumns {
+			panic(fmt.Errorf("invalid FlateDecode /Columns %d", columns))
+		}
 		switch pred.Int64() {
 		default:
 			if DebugOn {

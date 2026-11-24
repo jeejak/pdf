@@ -4,6 +4,55 @@
 
 A simple Go library which enables reading PDF files. Forked from https://github.com/rsc/pdf
 
+## Jeejak fork
+
+This is Jeejak's fork of [ledongthuc/pdf](https://github.com/ledongthuc/pdf),
+kept public. It is the parent at commit `5e46805` (2026-10-20) plus a few
+bounds against hostile input, which the Jeejak label reader needs because it
+parses PDFs uploaded by third parties. The module path is unchanged
+(`github.com/ledongthuc/pdf`), so a program uses the fork with a `replace`
+directive and no import changes:
+
+```
+replace github.com/ledongthuc/pdf => github.com/jeejak/pdf <version>
+```
+
+What changed, and why. Each guard below but one is a cherry-pick from the hardening
+branch at [Cwooper/pdf `harden`](https://github.com/Cwooper/pdf/tree/harden)
+(catalogued in issue 92 of the parent repository), applied with its original
+author and message; each commit names its source commit, and says which
+hunks were left out because the files or helpers they touch are not on this
+base.
+
+| Guard | Closes | Source commit (author) |
+|---|---|---|
+| /Extends chains capped at 32 hops, object stream nesting capped at 32 levels, plus bounds on the xref /Size, /Index, /W and predictor /Columns | an object stream that /Extends itself looped forever; a cycle through object streams overflowed the goroutine stack, a fatal error | `8274fa0` (gage-marshall) |
+| An object stream's header (/N, /First, /Length, /Extends) is read without following references into other object streams | a stream stored inside itself, or whose /N lives inside itself, overflowed the stack; nested headers doubled the work per level | `3c1de8b` (Cwooper) |
+| An object stream decodes at most 16 MiB | an object placed past inflated zeros was inflated on every resolve | `3d015d1` (Cwooper) |
+| Interpret reads at most 16 MiB of decoded content (harden uses 64 MiB; this fork lowers it, see `maxInterpretBytes`) | a few KB of Flate fed the lexer gigabytes; at 64 MiB a 1.5 KB page of nested arrays still kept one call busy 3.9 s, at 16 MiB about 1 s | `0384e0b` (Cwooper), cap lowered by us |
+| Interpret holds at most 2^18 operands, counting the entries of the arrays and dicts on its stack | a content stream of operands and no operator grew memory without bound (117 KB reached a 6,470 MiB heap) | `4ed0098`, `9d3255d` (Cwooper) |
+| Interpret opens the streams of a /Contents array one at a time, skipping an entry that is not a stream. Its per-entry charge against a decode budget is not carried, since the budget is not on this base, and neither is its newline between streams, since this base joins them as upstream does | an array naming one Flate stream 20,000 times opened every decoder up front (120 KB peaked at 893 MiB) | `5350959` (Cwooper), in part |
+| A /Contents array holds at most 1,024 streams. This replaces the per-entry charge as the time bound | one 8-stage stream named 262,000 times (1.5 MB) kept one Interpret call busy about 10 s | ours |
+| A stream's /Filter array holds at most 8 entries | stacked decoders were all built before any byte was read | the /Filter cap of `b7341a4` (Cwooper) |
+
+A refusal is reported the way this package already reports malformed
+input: `NewReader` returns an error, and the accessors with no error return
+(`NumPage`, `Page`, `Value.Key`, `Interpret`) panic. A caller reading
+untrusted files must recover, as it already had to. Measured on the 37
+label PDFs Jeejak's reader is tested against, no reading changed.
+
+`jeejak_hostile_test.go` builds each hostile file in the test and asserts a
+refusal within a deadline with no goroutine left behind. The tests carried
+by the source commits are not here, since the test files they extend come
+from earlier commits on that branch.
+
+The rest of the `harden` branch is not carried. It changes what callers see
+(`NumPage` counts the pages it lists rather than the declared /Count, and
+each Reader gets a decode budget), which Jeejak's reader does not want
+without its own review.
+
+The license is unchanged (BSD 3-Clause, see LICENSE).
+
 Features
   - Get plain text content (without format)
   - Get Content (including all font and formatting information)

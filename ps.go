@@ -5,9 +5,33 @@
 package pdf
 
 import (
+	"fmt"
 	"io"
 	"runtime"
 )
+
+// maxInterpretBytes bounds the decoded bytes one Interpret call reads: a
+// page's content streams or a cmap. Flate expands about 1000:1, so a small
+// file could otherwise feed the lexer gigabytes.
+//
+// Jeejak fork: 16 MiB rather than harden's 64 MiB. Interpret is one call a
+// caller's stop flag cannot reach, and at 64 MiB a 1.5 KB page of deeply
+// nested arrays and `pop` kept it busy about 4 seconds (3.9 s measured),
+// and at 16 MiB about 1 second. The largest decoded stream Interpret reads
+// in the 22 real labels the Jeejak label reader is tested against is
+// 86,391 bytes, so 16 MiB is about 190 times that. That figure counts
+// every page content stream, inline images included (an inline image is
+// part of the content stream and is lexed with it), and every Form XObject
+// and cmap. It leaves out image XObjects and font files, which Interpret
+// never reads; one real label has a 12,000,000-byte image XObject.
+const maxInterpretBytes = 16 << 20
+
+// maxOperands bounds the operands on Interpret's stack together with the array
+// and dict entries they hold, and the entries of any object read. Each is a
+// 32-byte Value or larger, so operands never consumed by an operator, from a
+// few kilobytes of Flate, would hold gigabytes. A cmap block mapping all
+// 65536 glyphs at once needs 131072.
+const maxOperands = 1 << 18
 
 // A Stack represents a stack of values.
 type Stack struct {
@@ -58,22 +82,29 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 	var dicts []dict
 	var rd io.Reader
 	if strm.Kind() == Array {
-		readers := make([]io.Reader, 0, strm.Len())
-		for i := 0; i < strm.Len(); i++ {
-			readers = append(readers, strm.Index(i).Reader())
+		if strm.Len() > maxContentsStreams {
+			panic(fmt.Errorf("content array has %d streams, more than %d", strm.Len(), maxContentsStreams))
 		}
-		rd = io.MultiReader(readers...)
+		rd = &contentsReader{streams: strm}
 	} else {
 		rd = strm.Reader()
 	}
 
-	b := newBuffer(rd, 0)
+	b := newBuffer(newLimitedReader(rd, maxInterpretBytes), 0)
 	b.allowEOF = true
 	b.allowObjptr = false
 	b.allowStream = false
 
 Reading:
 	for {
+		if stk.Len() == 0 && len(dicts) == 0 {
+			// The entries read so far belonged to operands now consumed,
+			// with no dict open that def could have kept them in.
+			b.entries = 0
+		}
+		if stk.Len()+b.entries > maxOperands {
+			panic(fmt.Errorf("more than %d operands", maxOperands))
+		}
 		tok := b.readToken()
 		if tok == io.EOF {
 			break
@@ -148,6 +179,49 @@ Reading:
 			continue
 		}
 		stk.Push(Value{nil, objptr{}, obj})
+	}
+}
+
+// maxContentsStreams bounds the streams of a /Contents array that Interpret
+// reads as one. Jeejak fork: harden's contentsReader charged each entry
+// against a per-Reader decode budget, which this fork does not carry, and
+// that charge was the only bound on the time an array takes: one 8-stage
+// Flate stream named 262,000 times kept a single Interpret call busy for
+// about 10 seconds, past any caller's deadline. Real pages split their
+// content into a handful of streams; 1,024 is far above that. At the cap
+// the time is set by maxInterpretBytes rather than by the count: 1,024
+// entries of a tiny 8-stage stream read in about 50 ms, while 1,024 entries
+// of an 8-stage stream decoding to 64 KiB of nested arrays reach the 16 MiB
+// cap and are refused after about 1 second (3.9 s at the old 64 MiB cap).
+const maxContentsStreams = 1 << 10
+
+// A contentsReader reads the streams of an array in turn, opening each only
+// once the one before it ends, so that a long array never holds a decoder
+// for every stream at once. An entry that is not a stream is skipped.
+type contentsReader struct {
+	streams Value
+	next    int
+	cur     io.Reader
+}
+
+func (c *contentsReader) Read(p []byte) (int, error) {
+	for {
+		for c.cur == nil {
+			if c.next >= c.streams.Len() {
+				return 0, io.EOF
+			}
+			if v := c.streams.Index(c.next); v.Kind() == Stream {
+				c.cur = v.Reader()
+			}
+			c.next++
+		}
+		n, err := c.cur.Read(p)
+		if err == io.EOF {
+			c.cur, err = nil, nil
+		}
+		if n > 0 || err != nil {
+			return n, err
+		}
 	}
 }
 
