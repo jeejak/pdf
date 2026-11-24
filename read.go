@@ -130,6 +130,15 @@ const (
 
 	// maxResolveDepth bounds recursion through objects stored inside object
 	// streams, which can be made to reference each other in a cycle.
+	//
+	// Jeejak fork: this is the backstop, not the guard. Since the header
+	// view (noObjStm, below in resolveAt) an object stream's header never
+	// resolves into another object stream, so resolving recurses at most
+	// one level and this cap is not reached. It stays because a stack
+	// overflow is fatal rather than recoverable, so a later change that
+	// reopens the recursion must still meet a bound. The depth restarts at
+	// zero on each Value.Key, so on its own it does not stop a cycle that
+	// runs through a header (see jeejak_hostile_test.go).
 	maxResolveDepth = 32
 
 	// maxPredictorColumns bounds the /Columns of a FlateDecode predictor,
