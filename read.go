@@ -135,6 +135,10 @@ const (
 	// maxPredictorColumns bounds the /Columns of a FlateDecode predictor,
 	// which sizes a row buffer.
 	maxPredictorColumns = 1 << 20
+
+	// maxFilters bounds a stream's /Filter array, whose decoders are all
+	// built before any byte is read. Real files chain two or three.
+	maxFilters = 8
 )
 
 // preallocXref returns a cross-reference table sized for the declared number of
@@ -997,6 +1001,9 @@ func (v Value) Reader() io.ReadCloser {
 	case Name:
 		rd = applyFilter(rd, filter.Name(), param)
 	case Array:
+		if filter.Len() > maxFilters {
+			panic(fmt.Errorf("stream has %d filters, more than %d", filter.Len(), maxFilters))
+		}
 		for i := 0; i < filter.Len(); i++ {
 			rd = applyFilter(rd, filter.Index(i).Name(), param.Index(i))
 		}
