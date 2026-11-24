@@ -136,6 +136,13 @@ func readEverything(data []byte) error {
 // the goroutine gone afterwards and the heap growth under maxAlloc.
 func assertRefused(t *testing.T, data []byte, maxAlloc uint64) {
 	t.Helper()
+	assertRefusedWithin(t, data, maxAlloc, hostileDeadline)
+}
+
+// assertRefusedWithin is assertRefused under a chosen deadline, for the
+// one file whose refusal means lexing the whole cap first.
+func assertRefusedWithin(t *testing.T, data []byte, maxAlloc uint64, limit time.Duration) {
+	t.Helper()
 	runtime.GC()
 	before := runtime.NumGoroutine()
 	var m0 runtime.MemStats
@@ -159,8 +166,8 @@ func assertRefused(t *testing.T, data []byte, maxAlloc uint64) {
 	var got outcome
 	select {
 	case got = <-done:
-	case <-time.After(hostileDeadline):
-		t.Fatalf("%d bytes: no answer within %s; the reader is still running", len(data), hostileDeadline)
+	case <-time.After(limit):
+		t.Fatalf("%d bytes: no answer within %s; the reader is still running", len(data), limit)
 	}
 	took := time.Since(start)
 	if got.err == nil && got.recovered == nil {
@@ -322,9 +329,12 @@ func TestHostile_OneHugeArrayOperand(t *testing.T) {
 
 // TestHostile_ContentThatInflatesPastTheCap: more decoded content than
 // Interpret reads, in operators that hold nothing, so only the byte cap
-// can refuse it.
+// can refuse it. The refusal comes after lexing 64 MiB, about 1.5s, and
+// the race detector makes that about ten times slower, hence the minute.
+// Its operands hold nothing, so the allocation bound here is only a
+// sanity check: what this test pins is the refusal itself.
 func TestHostile_ContentThatInflatesPastTheCap(t *testing.T) {
-	assertRefused(t, onePagePDF(bytes.Repeat([]byte("1 pop "), (maxInterpretBytes/6)+1024)), 512<<20)
+	assertRefusedWithin(t, onePagePDF(bytes.Repeat([]byte("1 pop "), (maxInterpretBytes/6)+1024)), 2<<30, time.Minute)
 }
 
 // TestHostile_ALegitimateObjectStreamStillReads keeps the guards honest:
