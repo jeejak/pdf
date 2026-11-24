@@ -71,6 +71,9 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 	var dicts []dict
 	var rd io.Reader
 	if strm.Kind() == Array {
+		if strm.Len() > maxContentsStreams {
+			panic(fmt.Errorf("content array has %d streams, more than %d", strm.Len(), maxContentsStreams))
+		}
 		rd = &contentsReader{streams: strm}
 	} else {
 		rd = strm.Reader()
@@ -167,6 +170,16 @@ Reading:
 		stk.Push(Value{nil, objptr{}, obj})
 	}
 }
+
+// maxContentsStreams bounds the streams of a /Contents array that Interpret
+// reads as one. Jeejak fork: harden's contentsReader charged each entry
+// against a per-Reader decode budget, which this fork does not carry, and
+// that charge was the only bound on the time an array takes: one 8-stage
+// Flate stream named 262,000 times kept a single Interpret call busy for
+// about 11 seconds, past any caller's deadline. Real pages split their
+// content into a handful of streams; 1,024 is far above that and costs
+// well under a second at worst.
+const maxContentsStreams = 1 << 10
 
 // A contentsReader reads the streams of an array in turn, opening each only
 // once the one before it ends, so that a long array never holds a decoder
