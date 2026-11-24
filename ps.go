@@ -13,7 +13,15 @@ import (
 // maxInterpretBytes bounds the decoded bytes one Interpret call reads: a
 // page's content streams or a cmap. Flate expands about 1000:1, so a small
 // file could otherwise feed the lexer gigabytes.
-const maxInterpretBytes = 64 << 20
+//
+// Jeejak fork: 16 MiB rather than harden's 64 MiB. Interpret is one call a
+// caller's stop flag cannot reach, and at 64 MiB a 1.5 KB page of deeply
+// nested arrays and `pop` kept it busy about 4 seconds (3.9 s measured),
+// and at 16 MiB about 1 second. The largest decoded stream Interpret reads
+// (content, Form or cmap; images and fonts excluded) in the 22 real labels
+// the Jeejak label reader is tested against is 86,391 bytes, so 16 MiB is
+// about 190 times that.
+const maxInterpretBytes = 16 << 20
 
 // maxOperands bounds the operands on Interpret's stack together with the array
 // and dict entries they hold, and the entries of any object read. Each is a
@@ -176,9 +184,12 @@ Reading:
 // against a per-Reader decode budget, which this fork does not carry, and
 // that charge was the only bound on the time an array takes: one 8-stage
 // Flate stream named 262,000 times kept a single Interpret call busy for
-// about 11 seconds, past any caller's deadline. Real pages split their
-// content into a handful of streams; 1,024 is far above that and costs
-// well under a second at worst.
+// about 10 seconds, past any caller's deadline. Real pages split their
+// content into a handful of streams; 1,024 is far above that. At the cap
+// the time is set by maxInterpretBytes rather than by the count: 1,024
+// entries of a tiny 8-stage stream read in about 50 ms, while 1,024 entries
+// of an 8-stage stream decoding to 64 KiB of nested arrays reach the 16 MiB
+// cap and are refused after about 1 second (3.9 s at the old 64 MiB cap).
 const maxContentsStreams = 1 << 10
 
 // A contentsReader reads the streams of an array in turn, opening each only
