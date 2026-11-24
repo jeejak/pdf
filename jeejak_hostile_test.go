@@ -341,8 +341,9 @@ func TestHostile_OneHugeArrayOperand(t *testing.T) {
 
 // TestHostile_ContentThatInflatesPastTheCap: more decoded content than
 // Interpret reads, in operators that hold nothing, so only the byte cap
-// can refuse it. The refusal comes after lexing 64 MiB, about 1.5s, and
-// the race detector makes that about ten times slower, hence the minute.
+// can refuse it. The refusal comes after lexing the 16 MiB cap, about
+// 0.3 s, and the race detector makes that about ten times slower, hence
+// the minute.
 // Its operands hold nothing, so the allocation bound here is only a
 // sanity check: what this test pins is the refusal itself.
 func TestHostile_ContentThatInflatesPastTheCap(t *testing.T) {
@@ -419,7 +420,12 @@ func peakHeapDuring(fn func()) uint64 {
 // Flate stream k times, with each stream decoded through filters stages
 // of /FlateDecode.
 func contentsArrayPDF(k, filters int) []byte {
-	content := []byte("BT ET\n")
+	return contentsArrayPDFOf([]byte("BT ET\n"), k, filters)
+}
+
+// contentsArrayPDFOf is contentsArrayPDF with the stream's decoded
+// content given.
+func contentsArrayPDFOf(content []byte, k, filters int) []byte {
 	for i := 0; i < filters; i++ {
 		var z bytes.Buffer
 		zw := zlib.NewWriter(&z)
@@ -634,4 +640,46 @@ func TestHostile_AnXrefStreamFieldWidthOverEightIsRefused(t *testing.T) {
 			assertRefused(t, xrefHostileFile(fmt.Sprintf("/Size 4 /W [1 %d 2]", w)), smallAlloc)
 		})
 	}
+}
+
+// nestedArraysContent is n repetitions of an array nested depth levels
+// deep followed by `pop`, which Interpret runs itself: the most lexing
+// work per decoded byte that no callback ever sees.
+func nestedArraysContent(depth, n int) []byte {
+	unit := strings.Repeat("[", depth) + strings.Repeat("]", depth) + " pop "
+	return bytes.Repeat([]byte(unit), n)
+}
+
+// TestHostile_NestedArraysInflatingPastTheCapAreRefusedInBoundedTime: a
+// 1.5 KB page whose one 8-stage Flate stream decodes to 64 MiB of arrays
+// nested 999 deep, each followed by `pop`. No operator reaches the
+// callback, so the whole stream is one stretch no stop flag can reach. At
+// harden's 64 MiB cap that was about 4 s (3.9 s measured); at 16 MiB it is
+// refused after about 1 s.
+func TestHostile_NestedArraysInflatingPastTheCapAreRefusedInBoundedTime(t *testing.T) {
+	data := contentsArrayPDFOf(nestedArraysContent(999, (64<<20)/2003+64), 1, 8)
+	start := time.Now()
+	assertRefusedWithin(t, data, 2<<30, time.Minute)
+	took := time.Since(start)
+	// 2.5 s is the ceiling without the race detector, which makes the
+	// lexing about ten times slower.
+	if !raceEnabled && took > 2500*time.Millisecond {
+		t.Fatalf("%d bytes refused after %s, want under 2.5s", len(data), took)
+	}
+	t.Logf("%d bytes refused after %s", len(data), took.Round(time.Millisecond))
+}
+
+// TestHostile_TheMostContentStreamsOfRealContentAreRefusedInBoundedTime:
+// 1,024 entries, the most a /Contents array may have, of an 8-stage
+// stream decoding to 64 KiB of the same nested arrays. The array cap does
+// not bound this; the Interpret byte cap does, at 16 MiB.
+func TestHostile_TheMostContentStreamsOfRealContentAreRefusedInBoundedTime(t *testing.T) {
+	data := contentsArrayPDFOf(nestedArraysContent(999, 32), maxContentsStreams, 8)
+	start := time.Now()
+	assertRefusedWithin(t, data, 2<<30, time.Minute)
+	took := time.Since(start)
+	if !raceEnabled && took > 2500*time.Millisecond {
+		t.Fatalf("%d bytes refused after %s, want under 2.5s", len(data), took)
+	}
+	t.Logf("%d bytes refused after %s", len(data), took.Round(time.Millisecond))
 }
