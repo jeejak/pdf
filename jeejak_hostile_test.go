@@ -18,7 +18,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
+	"runtime/metrics"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -40,6 +42,13 @@ type stmEntry struct {
 // with a cross-reference stream, so objects may live in object streams.
 // Object 1 must be the catalog.
 func buildXrefStreamPDF(objs []stmEntry) []byte {
+	return buildXrefStreamPDFWith(objs, "")
+}
+
+// buildXrefStreamPDFWith is buildXrefStreamPDF with the xref stream's
+// /Size and /W replaced by xrefHdr when it is not empty, to put a hostile
+// value in the cross-reference stream itself.
+func buildXrefStreamPDFWith(objs []stmEntry, xrefHdr string) []byte {
 	var out bytes.Buffer
 	out.WriteString("%PDF-1.5\n")
 	offs := make([]int, len(objs)+1)
@@ -67,8 +76,11 @@ func buildXrefStreamPDF(objs []stmEntry) []byte {
 	}
 	xrefOff := out.Len()
 	ent(1, uint32(xrefOff), 0)
-	fmt.Fprintf(&out, "%d 0 obj\n<< /Type /XRef /Size %d /Root 1 0 R /W [1 4 2] /Length %d >>\nstream\n",
-		xrefNum, xrefNum+1, x.Len())
+	if xrefHdr == "" {
+		xrefHdr = fmt.Sprintf("/Size %d /W [1 4 2]", xrefNum+1)
+	}
+	fmt.Fprintf(&out, "%d 0 obj\n<< /Type /XRef %s /Root 1 0 R /Length %d >>\nstream\n",
+		xrefNum, xrefHdr, x.Len())
 	out.Write(x.Bytes())
 	fmt.Fprintf(&out, "\nendstream\nendobj\nstartxref\n%d\n%%%%EOF\n", xrefOff)
 	return out.Bytes()
@@ -370,5 +382,159 @@ func TestHostile_ALegitimateObjectStreamStillReads(t *testing.T) {
 	})
 	if got := strings.Join(ops, " "); got != "BT Tj ET" {
 		t.Fatalf("operators = %q, want %q", got, "BT Tj ET")
+	}
+}
+
+// peakHeapDuring runs fn and reports the largest live heap seen while it
+// ran, sampled every millisecond. TotalAlloc cannot tell a reader that
+// opens a decoder at a time from one that holds them all, since both
+// allocate the same in sum; the peak can.
+func peakHeapDuring(fn func()) uint64 {
+	var peak atomic.Uint64
+	stop := make(chan struct{})
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+		for {
+			metrics.Read(sample)
+			if v := sample[0].Value.Uint64(); v > peak.Load() {
+				peak.Store(v)
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+	runtime.GC()
+	fn()
+	close(stop)
+	<-sampled
+	return peak.Load()
+}
+
+// contentsArrayPDF is one page whose /Contents array names one small
+// Flate stream k times, with each stream decoded through filters stages
+// of /FlateDecode.
+func contentsArrayPDF(k, filters int) []byte {
+	content := []byte("BT ET\n")
+	for i := 0; i < filters; i++ {
+		var z bytes.Buffer
+		zw := zlib.NewWriter(&z)
+		zw.Write(content)
+		zw.Close()
+		content = z.Bytes()
+	}
+	filter := "/FlateDecode"
+	if filters > 1 {
+		filter = "[" + strings.TrimSpace(strings.Repeat("/FlateDecode ", filters)) + "]"
+	}
+	refs := strings.Repeat("4 0 R ", k)
+	objs := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents [" + refs + "] >>",
+		fmt.Sprintf("<< /Filter %s /Length %d >>\nstream\n%s\nendstream", filter, len(content), content),
+	}
+	var out bytes.Buffer
+	out.WriteString("%PDF-1.4\n")
+	offs := make([]int, len(objs))
+	for i, o := range objs {
+		offs[i] = out.Len()
+		fmt.Fprintf(&out, "%d 0 obj\n%s\nendobj\n", i+1, o)
+	}
+	xref := out.Len()
+	fmt.Fprintf(&out, "xref\n0 %d\n0000000000 65535 f \n", len(objs)+1)
+	for _, off := range offs {
+		fmt.Fprintf(&out, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&out, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xref)
+	return out.Bytes()
+}
+
+// TestHostile_AContentsArrayOpensOneDecoderAtATime: a page whose
+// /Contents array names one Flate stream 20,000 times. Interpret opened
+// a decoder for every entry before reading any, about 45 KiB each, so
+// 120 KB of file held about 900 MiB at once. It now opens each when the
+// one before it ends, and the page still reads.
+func TestHostile_AContentsArrayOpensOneDecoderAtATime(t *testing.T) {
+	data := contentsArrayPDF(20_000, 1)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	ops := 0
+	start := time.Now()
+	peak := peakHeapDuring(func() {
+		Interpret(r.Page(1).V.Key("Contents"), func(stk *Stack, op string) { ops++ })
+	})
+	if want := 2 * 20_000; ops != want {
+		t.Fatalf("read %d operators, want %d", ops, want)
+	}
+	if peak > 128<<20 {
+		t.Fatalf("%d bytes: the heap peaked at %d MiB while reading, want under 128 MiB: "+
+			"the decoders are opened up front again", len(data), peak>>20)
+	}
+	t.Logf("%d bytes: %d operators in %s, heap peak %d MiB", len(data), ops,
+		time.Since(start).Round(time.Millisecond), peak>>20)
+}
+
+// TestHostile_TooManyStackedFiltersAreRefused: one stream decoded
+// through twenty /FlateDecode stages, named 400 times by a /Contents
+// array. Every stage's decoder is built before a byte is read.
+func TestHostile_TooManyStackedFiltersAreRefused(t *testing.T) {
+	assertRefused(t, contentsArrayPDF(400, 20), smallAlloc)
+}
+
+// TestHostile_EightStackedFiltersStillRead pins the filter cap from
+// below: eight stages is the most a stream may chain, and it reads.
+func TestHostile_EightStackedFiltersStillRead(t *testing.T) {
+	data := contentsArrayPDF(1, 8)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	var ops []string
+	Interpret(r.Page(1).V.Key("Contents"), func(stk *Stack, op string) { ops = append(ops, op) })
+	if got := strings.Join(ops, " "); got != "BT ET" {
+		t.Fatalf("operators = %q, want %q", got, "BT ET")
+	}
+}
+
+// The cross-reference stream bounds from 8274fa0. Each value below is
+// read while the file is opened, so NewReader must return an error for
+// it, quickly and without allocating what the value asks for.
+func xrefHostileFile(xrefHdr string) []byte {
+	return buildXrefStreamPDFWith([]stmEntry{
+		{body: "<< /Type /Catalog /Pages 2 0 R >>"},
+		{body: "<< /Type /Pages /Kids [] /Count 0 >>"},
+	}, xrefHdr)
+}
+
+// TestHostile_AnXrefStreamSizeOfTwoToTheThirtyIsRefused: /Size sized
+// the table with make directly, so 2^30 asked for about 40 GiB.
+func TestHostile_AnXrefStreamSizeOfTwoToTheThirtyIsRefused(t *testing.T) {
+	assertRefused(t, xrefHostileFile(fmt.Sprintf("/Size %d /W [1 4 2]", 1<<30)), smallAlloc)
+}
+
+// TestHostile_AnXrefStreamIndexFarOutIsRefused: /Index names object
+// numbers that index the table, so [4000000000 1] grew it by about
+// 128 GB for one entry.
+func TestHostile_AnXrefStreamIndexFarOutIsRefused(t *testing.T) {
+	assertRefused(t, xrefHostileFile("/Size 4 /Index [4000000000 1] /W [1 4 2]"), smallAlloc)
+}
+
+// TestHostile_AnXrefStreamFieldWidthOverEightIsRefused: a /W width is
+// a slice bound and sizes the read buffer. 99 was already refused
+// upstream, since the row it implies runs past the stream; 2^30 was not,
+// and sized a gigabyte buffer for one row. Anything over eight bytes is
+// now refused before the buffer is made.
+func TestHostile_AnXrefStreamFieldWidthOverEightIsRefused(t *testing.T) {
+	for _, w := range []int{99, 1 << 30} {
+		t.Run(fmt.Sprint(w), func(t *testing.T) {
+			assertRefused(t, xrefHostileFile(fmt.Sprintf("/Size 4 /W [1 %d 2]", w)), smallAlloc)
+		})
 	}
 }
