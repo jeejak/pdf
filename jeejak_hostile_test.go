@@ -342,8 +342,8 @@ func TestHostile_OneHugeArrayOperand(t *testing.T) {
 // TestHostile_ContentThatInflatesPastTheCap: more decoded content than
 // Interpret reads, in operators that hold nothing, so only the byte cap
 // can refuse it. The refusal comes after lexing the 16 MiB cap, about
-// 0.3 s, and the race detector makes that about ten times slower, hence
-// the minute.
+// 0.36 s, and under the race detector 4.5 s (measured 12.6 times
+// slower on this content), hence the minute.
 // Its operands hold nothing, so the allocation bound here is only a
 // sanity check: what this test pins is the refusal itself.
 func TestHostile_ContentThatInflatesPastTheCap(t *testing.T) {
@@ -661,8 +661,9 @@ func TestHostile_NestedArraysInflatingPastTheCapAreRefusedInBoundedTime(t *testi
 	start := time.Now()
 	assertRefusedWithin(t, data, 2<<30, time.Minute)
 	took := time.Since(start)
-	// 2.5 s is the ceiling without the race detector, which makes the
-	// lexing about ten times slower.
+	// 2.5 s is the ceiling without the race detector. Under it this
+	// content measured 3.8 to 4.1 times slower (1.4 s against 5.4 s),
+	// so the ceiling is skipped there and only the refusal is asserted.
 	if !raceEnabled && took > 2500*time.Millisecond {
 		t.Fatalf("%d bytes refused after %s, want under 2.5s", len(data), took)
 	}

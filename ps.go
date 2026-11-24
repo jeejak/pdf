@@ -18,9 +18,12 @@ import (
 // caller's stop flag cannot reach, and at 64 MiB a 1.5 KB page of deeply
 // nested arrays and `pop` kept it busy about 4 seconds (3.9 s measured),
 // and at 16 MiB about 1 second. The largest decoded stream Interpret reads
-// (content, Form or cmap; images and fonts excluded) in the 22 real labels
-// the Jeejak label reader is tested against is 86,391 bytes, so 16 MiB is
-// about 190 times that.
+// in the 22 real labels the Jeejak label reader is tested against is
+// 86,391 bytes, so 16 MiB is about 190 times that. That figure counts
+// every page content stream, inline images included (an inline image is
+// part of the content stream and is lexed with it), and every Form XObject
+// and cmap. It leaves out image XObjects and font files, which Interpret
+// never reads; one real label has a 12,000,000-byte image XObject.
 const maxInterpretBytes = 16 << 20
 
 // maxOperands bounds the operands on Interpret's stack together with the array
